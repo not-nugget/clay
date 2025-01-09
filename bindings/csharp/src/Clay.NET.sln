@@ -1,6 +1,8 @@
 ﻿
 Microsoft Visual Studio Solution File, Format Version 12.00
-Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Clay.NET", "Clay.NET.csproj", "{E0FBF1F4-CB50-40B2-BBE7-AAC7A922A579}"
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "ClayUI", "ClayUI\ClayUI.csproj", "{994667E6-FF52-4ABC-A326-C40797841F5E}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "ClayUI.Smoke", "ClayUI.Smoke\ClayUI.Smoke.csproj", "{4A941ABD-0070-490B-9681-1331165FF38A}"
 EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
@@ -8,9 +10,13 @@ Global
 		Release|Any CPU = Release|Any CPU
 	EndGlobalSection
 	GlobalSection(ProjectConfigurationPlatforms) = postSolution
-		{E0FBF1F4-CB50-40B2-BBE7-AAC7A922A579}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
-		{E0FBF1F4-CB50-40B2-BBE7-AAC7A922A579}.Debug|Any CPU.Build.0 = Debug|Any CPU
-		{E0FBF1F4-CB50-40B2-BBE7-AAC7A922A579}.Release|Any CPU.ActiveCfg = Release|Any CPU
-		{E0FBF1F4-CB50-40B2-BBE7-AAC7A922A579}.Release|Any CPU.Build.0 = Release|Any CPU
+		{994667E6-FF52-4ABC-A326-C40797841F5E}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{994667E6-FF52-4ABC-A326-C40797841F5E}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{994667E6-FF52-4ABC-A326-C40797841F5E}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{994667E6-FF52-4ABC-A326-C40797841F5E}.Release|Any CPU.Build.0 = Release|Any CPU
+		{4A941ABD-0070-490B-9681-1331165FF38A}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{4A941ABD-0070-490B-9681-1331165FF38A}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{4A941ABD-0070-490B-9681-1331165FF38A}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{4A941ABD-0070-490B-9681-1331165FF38A}.Release|Any CPU.Build.0 = Release|Any CPU
 	EndGlobalSection
 EndGlobal
