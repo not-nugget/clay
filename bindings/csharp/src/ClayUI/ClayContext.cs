@@ -5,16 +5,27 @@ namespace Clay;
 /// <summary>Represents a context used to interface with the Clay library</summary>
 public sealed class ClayContext : IDisposable
 {
-    private readonly ClayArena     _arena;
-    private          LayoutHandle? _currentLayout;
+    private readonly ClayArenaMemoryHandle _arenaHandle;
+    private          LayoutHandle?        _currentLayout;
 
-    internal ClayContext(ClayArena arena) { _arena = arena; }
+    internal ClayContext(ClayArenaMemoryHandle arena) => _arenaHandle = arena;
 
     public void Dispose()
     {
         _currentLayout?.Dispose();
-        _arena.Dispose();
+        _arenaHandle.Dispose();
     }
+
+    /// <summary>Updates Clay's internal dimensions. Should match the dimensions of the render target</summary>
+    public void UpdateDimensions(ClayDimensions dimensions) 
+        => Clay.UpdateDimensions(dimensions);
+    
+    /// <summary>Updates Clay's internal mouse state information. Needed for interactive UI</summary>
+    public void UpdateMouseState(ClayVector2 cursorPosition, bool isMouseDown) 
+        => Clay.UpdateMouseState(cursorPosition, isMouseDown);
+
+    public void UpdateScrollContainers(bool enableDragScrolling, ClayVector2 mouseWheelDelta, float deltaTime)
+        => Clay.UpdateScrollContainers(enableDragScrolling, mouseWheelDelta, deltaTime);
 
     /// <summary>Starts a new layout</summary>
     /// <returns><see cref="LayoutHandle" /> to reference</returns>
@@ -70,8 +81,8 @@ public sealed class ClayContext : IDisposable
     }
 
     /// <summary>Creates and initializes a new <see cref="ClayContext" /> instance with an optional error handler callback function</summary>
-    public static ClayContext Create(ClayDimensions dimensions = default, ErrorHandlerFunction? errorHandlerCallback = null)
-        => Clay.Initialize(dimensions, errorHandlerCallback);
+    public static ClayContext Create(ClayDimensions dimensions, MeasureTextFunction measureTextFunction, ErrorHandlerFunction? errorHandlerCallback = null)
+        => Clay.Initialize(dimensions, measureTextFunction, errorHandlerCallback);
 }
 
 //TODO does this need to be a class?

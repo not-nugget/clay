@@ -47,13 +47,73 @@ public static unsafe class ScrollElementConfigMarshaller
         private readonly byte _bHorizontal = bHorizontal;
         private readonly byte _bVertical   = bVertical;
     }
-        
+
     public static nint ConvertToUnmanaged(ScrollElementConfig managed)
     {
         var bHorizontal = (byte)(managed.Horizontal ? 1 : 0);
-        var bVertical = (byte)(managed.Vertical ? 1 : 0);
-        var  interop     = new ScrollElementConfigInterop(bHorizontal, bVertical);
+        var bVertical   = (byte)(managed.Vertical ? 1 : 0);
+        var interop     = new ScrollElementConfigInterop(bHorizontal, bVertical);
         return (nint)Unsafe.AsPointer(ref interop);
+    }
+}
+
+/// <summary>Controls the lifetime of CLR strings that are marshaled into unmanaged memory</summary>
+internal sealed class StringBufferHandle : SafeHandle
+{
+    /// <summary>String value of the handle</summary>
+    internal string StringValue { get; }
+
+    public StringBufferHandle(string strVal) : base(IntPtr.Zero, true)
+    {
+        StringValue = strVal;
+
+        // We only need to marshal a non-null string
+        if (!string.IsNullOrEmpty(strVal))
+            handle = Marshal.StringToHGlobalAuto(StringValue);
+    }
+
+    protected override bool ReleaseHandle()
+    {
+        // No release is required if null or an empty string was marshalled
+        if (string.IsNullOrEmpty(StringValue))
+            return true;
+
+        try
+        {
+            Marshal.FreeHGlobal(handle);
+            handle = IntPtr.Zero;
+            return true;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    public override bool IsInvalid
+        => handle == IntPtr.Zero;
+}
+
+/// <summary>Controls the unmanaged lifetime of the <see cref="ClayArena"/> memory pointer</summary>
+internal sealed class ClayArenaMemoryHandle : SafeHandle
+{
+    public override bool IsInvalid
+        => handle == IntPtr.Zero;
+
+    public ClayArenaMemoryHandle(uint byteCount) : base(IntPtr.Zero, true) 
+        => handle = Marshal.AllocHGlobal((int)byteCount);
+
+    protected override bool ReleaseHandle()
+    {
+        try
+        {
+            Marshal.FreeHGlobal(handle);
+            return true;
+        }
+        catch
+        {
+            return false;
+        }
     }
 }
 
@@ -62,34 +122,26 @@ internal static partial class Clay
 {
     /// <summary>Initialize a new <see cref="ClayContext" /></summary>
     /// <param name="dimensions">Initial dimensions of the created window</param>
+    /// <param name="measureTextFunction">Required text measurement function</param>
     /// <param name="errorHandlerCallback">Optional error handler callback delegate to be called if Clay encounters an error</param>
     /// <returns><see cref="ClayContext" /> instance for use in creating your Clay UI</returns>
-    internal static ClayContext Initialize(ClayDimensions dimensions, ErrorHandlerFunction? errorHandlerCallback)
+    internal static ClayContext Initialize(ClayDimensions dimensions, MeasureTextFunction measureTextFunction, ErrorHandlerFunction? errorHandlerCallback)
     {
         ClayContext? context;
         try
         {
-            var memorySize        = Clay_MinMemorySize();
-            var alignedMemorySize = (nuint)memorySize;
-
-            IntPtr memory;
-            unsafe
-            {
-                memory = new IntPtr(NativeMemory.AllocZeroed(alignedMemorySize));
-            }
-
             var errorHandler = new ClayErrorHandler();
+            if (errorHandlerCallback != null)
+                errorHandler.ErrorHandlerFunction = errorHandlerCallback;
 
-            //TODO TEMPORARY
-            errorHandler.ErrorHandlerFunction = Temporary__ClayError;
-            // if (errorHandlerCallback != null)
-            //     errorHandler.ErrorHandlerFunction = errorHandlerCallback;
+            var memorySize = Clay_MinMemorySize();
+            var arenaMemoryHandle = new ClayArenaMemoryHandle(memorySize);
+            var arena = Clay_CreateArenaWithCapacityAndMemory(memorySize, arenaMemoryHandle.DangerousGetHandle());
 
-            var arena = Clay_CreateArenaWithCapacityAndMemory(memorySize, memory);
             Clay_Initialize(arena, dimensions, errorHandler);
+            Clay_SetMeasureTextFunction(measureTextFunction);
 
-            Clay_SetMeasureTextFunction(Temporary__MeasureText); //TODO temporary
-            context = new ClayContext(arena);
+            context = new ClayContext(arenaMemoryHandle);
         }
         catch (Exception e)
         {
@@ -97,18 +149,6 @@ internal static partial class Clay
         }
 
         return context;
-    }
-
-    internal static void Temporary__ClayError(ErrorData errorData) { Console.Error.WriteLine($"Clay encountered an error {errorData.ErrorType}:{errorData.ErrorText}"); }
-
-    internal static ClayDimensions Temporary__MeasureText(ref string text, ref TextElementConfig config)
-    {
-        Console.WriteLine($"Clay calling MeasureText: {text};");
-        return new ClayDimensions()
-        {
-            Height = 10,
-            Width  = 10,
-        };
     }
 
     /// <summary>Start a new Clay layout</summary>
@@ -145,28 +185,14 @@ internal static partial class Clay
 
     public static void OpenTextElement(string text, ref TextElementConfig config)
     {
+        using var textBufferHandle = new StringBufferHandle(text);
         var clayString = new ClayString
         {
             Length = text.Length,
+            Chars  = textBufferHandle.DangerousGetHandle(),
         };
 
-        unsafe
-        {
-            fixed (char* stringPtr = text)
-            {
-                clayString.Chars = new IntPtr(&stringPtr[0]);
-            }
-        }
-
-        try
-        {
-            Clay__OpenTextElement(clayString, ref config);
-        }
-        catch (Exception e)
-        {
-            Console.Error.WriteLine(e);
-            throw;
-        }
+        Clay__OpenTextElement(clayString, ref config);
     }
 
     internal static void AttachId(ref ElementId elementId)
@@ -177,18 +203,13 @@ internal static partial class Clay
 
         var seed = Clay__GetParentElementId();
         var i    = elementId.Offset;
+        
+        using var textBufferHandle = new StringBufferHandle(elementId.Value);
         var clayString = new ClayString
         {
             Length = elementId.Value.Length,
+            Chars  = textBufferHandle.DangerousGetHandle(),
         };
-
-        unsafe
-        {
-            fixed (char* stringPtr = elementId.Value)
-            {
-                clayString.Chars = new IntPtr(&stringPtr[0]);
-            }
-        }
 
         var unmanagedElementId = Clay__HashString(clayString, i, seed);
         Clay__AttachId(unmanagedElementId);
@@ -250,7 +271,7 @@ internal static partial class Clay
             default:
                 throw new InvalidOperationException("Attempted to attach and unknown or unsupported element config type");
         }
-        
+
         Clay__AttachElementConfig((ClayElementConfigurationUnion)arenaPtr, configPointer.Type);
     }
 
@@ -262,45 +283,54 @@ internal static partial class Clay
     internal static void CloseElement()
         => Clay__CloseElement();
 
+    internal static void UpdateMouseState(ClayVector2 cursorPosition, bool isMouseDown)
+        => Clay_SetPointerState(cursorPosition, isMouseDown);
+
+    internal static void UpdateScrollContainers(bool enableDragScrolling, ClayVector2 mouseWheelDelta, float deltaTime)
+        => Clay_UpdateScrollContainers(enableDragScrolling, mouseWheelDelta, deltaTime);
+
     #region 1:1 Bindings
-    [LibraryImport("clay.dll")]
+    [LibraryImport("clay.dll", SetLastError = true)]
     private static partial uint Clay_MinMemorySize();
 
-    [LibraryImport("clay.dll")]
-    private static partial ClayArena Clay_CreateArenaWithCapacityAndMemory(uint capacity, IntPtr offset);
+    [LibraryImport("clay.dll", SetLastError = true)]
+    private static partial ClayArena Clay_CreateArenaWithCapacityAndMemory(uint capacity, IntPtr memory);
 
-    [LibraryImport("clay.dll")]
+    [LibraryImport("clay.dll", SetLastError = true)]
     private static partial void Clay_SetPointerState(ClayVector2 position, [MarshalAs(UnmanagedType.Bool)] bool pointerDown);
 
-    [LibraryImport("clay.dll")]
+    [LibraryImport("clay.dll", SetLastError = true)]
     private static partial void Clay_Initialize(ClayArena arena, ClayDimensions dimensions, ClayErrorHandler errorHandler);
 
-    [LibraryImport("clay.dll")]
+    public static void UpdateDimensions(ClayDimensions dimensions)
+        => Clay_SetLayoutDimensions(dimensions);
+
+    [LibraryImport("clay.dll", SetLastError = true)]
     private static partial void Clay_UpdateScrollContainers([MarshalAs(UnmanagedType.Bool)] bool enableDragScrolling, ClayVector2 scrollDelta, float deltaTime);
 
-    [LibraryImport("clay.dll")]
+    [LibraryImport("clay.dll", SetLastError = true)]
     private static partial void Clay_SetLayoutDimensions(ClayDimensions dimensions);
 
-    [LibraryImport("clay.dll")]
+    [LibraryImport("clay.dll", SetLastError = true)]
     private static partial void Clay_BeginLayout();
 
-    [LibraryImport("clay.dll")]
+    [LibraryImport("clay.dll", SetLastError = true)]
     private static partial ClayRenderCommandArray Clay_EndLayout();
 
-    [LibraryImport("clay.dll")]
+    [LibraryImport("clay.dll", SetLastError = true)]
     private static partial ClayElementId Clay_GetElementId(ClayString idString);
 
-    [LibraryImport("clay.dll")]
+    [LibraryImport("clay.dll", SetLastError = true)]
     private static partial ClayElementId Clay_GetElementIdWithIndex(ClayString idString, uint index);
 
-    [LibraryImport("clay.dll")]
+    [LibraryImport("clay.dll", SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
     private static partial bool ClayHovered();
 
-    [LibraryImport("clay.dll")]
+    [LibraryImport("clay.dll", SetLastError = true)]
     private static partial void Clay_OnHover(OnHoverFunctionHandler onHoverFunctionHandler, IntPtr userData);
 
-    [LibraryImport("clay.dll")]
+    [LibraryImport("clay.dll", SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
     private static partial bool Clay_PointerOver(ClayElementId elementId);
 
@@ -308,87 +338,87 @@ internal static partial class Clay
     [DllImport("clay.dll")]
     private static extern ClayScrollContainerData Clay_GetScrollContainerData(ClayElementId id);
 
-    [LibraryImport("clay.dll")]
+    [LibraryImport("clay.dll", SetLastError = true)]
     private static partial void Clay_SetMeasureTextFunction(MeasureTextFunction measureTextFunction);
 
-    [LibraryImport("clay.dll")]
+    [LibraryImport("clay.dll", SetLastError = true)]
     private static partial void Clay_SetQueryScrollOffsetFunction(QueryScrollOffsetFunction queryScrollOffsetFunction);
 
     // Accessing each index of the array can be done in managed memory and does not need to interop
-    // [LibraryImport("clay.dll")]
+    // [LibraryImport("clay.dll", SetLastError = true)]
     // private static partial Clay_RenderCommand *     Clay_RenderCommandArray_Get(Clay_RenderCommandArray* array, int32_t index);
 
-    [LibraryImport("clay.dll")]
+    [LibraryImport("clay.dll", SetLastError = true)]
     private static partial void Clay_SetDebugModeEnabled([MarshalAs(UnmanagedType.Bool)] bool enabled);
 
-    [LibraryImport("clay.dll")]
+    [LibraryImport("clay.dll", SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
     private static partial bool Clay_IsDebugModeEnabled();
 
-    [LibraryImport("clay.dll")]
+    [LibraryImport("clay.dll", SetLastError = true)]
     private static partial void Clay_SetCullingEnabled([MarshalAs(UnmanagedType.Bool)] bool enabled);
 
-    [LibraryImport("clay.dll")]
+    [LibraryImport("clay.dll", SetLastError = true)]
     private static partial void Clay_SetMaxElementCount(int maxElementCount);
 
-    [LibraryImport("clay.dll")]
+    [LibraryImport("clay.dll", SetLastError = true)]
     private static partial void Clay_SetMaxMeasureTextCacheWordCount(int maxMeasureTextCacheWordCount);
 
-    [LibraryImport("clay.dll")]
+    [LibraryImport("clay.dll", SetLastError = true)]
     private static partial void Clay__OpenElement();
 
-    [LibraryImport("clay.dll")]
+    [LibraryImport("clay.dll", SetLastError = true)]
     private static partial void Clay__CloseElement();
 
     /// <returns><see cref="IntPtr"/> that points to a Clay managed instance of <see cref="LayoutConfig"/>(<paramref name="config"/>)</returns>
-    [LibraryImport("clay.dll")]
+    [LibraryImport("clay.dll", SetLastError = true)]
     private static partial IntPtr Clay__StoreLayoutConfig(LayoutConfig config);
 
-    [LibraryImport("clay.dll")]
+    [LibraryImport("clay.dll", SetLastError = true)]
     private static partial void Clay__ElementPostConfiguration();
 
-    [LibraryImport("clay.dll")]
+    [LibraryImport("clay.dll", SetLastError = true)]
     private static partial void Clay__AttachId(ClayElementId id);
 
-    [LibraryImport("clay.dll")]
+    [LibraryImport("clay.dll", SetLastError = true)]
     private static partial void Clay__AttachLayoutConfig(ref LayoutConfig config);
 
-    [LibraryImport("clay.dll")]
+    [LibraryImport("clay.dll", SetLastError = true)]
     private static partial void Clay__AttachElementConfig(ClayElementConfigurationUnion configuration, ClayElementConfigType type);
 
-    [LibraryImport("clay.dll")]
+    [LibraryImport("clay.dll", SetLastError = true)]
     private static partial IntPtr Clay__StoreRectangleElementConfig(RectangleElementConfig config);
 
-    [LibraryImport("clay.dll")]
+    [LibraryImport("clay.dll", SetLastError = true)]
     private static partial IntPtr Clay__StoreTextElementConfig(TextElementConfig config);
 
-    [LibraryImport("clay.dll")]
+    [LibraryImport("clay.dll", SetLastError = true)]
     private static partial IntPtr Clay__StoreImageElementConfig(ImageElementConfig config);
 
-    [LibraryImport("clay.dll")]
+    [LibraryImport("clay.dll", SetLastError = true)]
     private static partial IntPtr Clay__StoreFloatingElementConfig(FloatingElementConfig config);
 
     // Not currently supporting custom element config
-    // [LibraryImport("clay.dll")]
+    // [LibraryImport("clay.dll", SetLastError = true)]
     // private static partial Clay_CustomElementConfig *    Clay__StoreCustomElementConfig(Clay_CustomElementConfig       config);
 
-    [LibraryImport("clay.dll")]
+    [LibraryImport("clay.dll", SetLastError = true)]
     private static partial IntPtr Clay__StoreScrollElementConfig([MarshalUsing(typeof(ScrollElementConfigMarshaller))] ScrollElementConfig config);
-    
-    [LibraryImport("clay.dll")]
+
+    [LibraryImport("clay.dll", SetLastError = true)]
     private static partial IntPtr Clay__StoreBorderElementConfig(BorderElementConfig config);
 
-    [LibraryImport("clay.dll")]
+    [LibraryImport("clay.dll", SetLastError = true)]
     private static partial ClayElementId Clay__HashString(ClayString key, uint offset, uint seed);
 
     //TODO This just isn't working and I have no idea why. I'm marshalling ClayString when I set an element's ID just fine, but here it explodes
-    [LibraryImport("clay.dll")]
+    [LibraryImport("clay.dll", SetLastError = true)]
     private static partial void Clay__OpenTextElement(ClayString content, ref TextElementConfig config);
 
-    [LibraryImport("clay.dll")]
+    [LibraryImport("clay.dll", SetLastError = true)]
     private static partial uint Clay__GetParentElementId();
 
-    [LibraryImport("clay.dll")]
+    [LibraryImport("clay.dll", SetLastError = true)]
     private static partial IntPtr Clay__GetOpenLayoutElement();
     #endregion
 }
@@ -400,6 +430,7 @@ internal struct ClayString
     public IntPtr Chars  { get; internal set; }
 }
 
+//TODO is this used? 
 internal struct ClayStringArray
 {
     //TODO Clay_StringArray is a private type and therefore should not ever be user-accessible
@@ -408,25 +439,24 @@ internal struct ClayStringArray
     private IntPtr array; //TODO SafeHandle, or unsafe ClayString*, or alternative layout?
 }
 
-internal unsafe struct ClayArena : IDisposable
+/// <summary>Unmanaged Clay memory arena</summary>
+internal struct ClayArena
 {
-    //TODO Clay_Arena is not a private type, but the user should not have to worry about passing around their own arena. Instead, a ClayContext class should be created and is responsible for all unmanaged CLAY resources
-    private nuint nextAllocation;
-    private int   capacity;
-    private void* memory; //TODO SafeHandle, or unsafe ClayString*, or alternative layout?
+    #pragma warning disable CS0169 // Field is never used - Used in native code by Clay
+    private UIntPtr _nextAllocation;
+    private int     _capacity;
+    #pragma warning restore CS0169 // Field is never used
 
-    public readonly void Dispose()
-    {
-        if (memory is not null)
-            //TODO maybe this shouldn't be done? Much more research needs to be done with this, as it is very possible that clay will always correctly handle the disposal of the arena
-            NativeMemory.Free(memory);
-    }
+    internal IntPtr Memory { get; private set; }
 }
 
+/// <summary>Dimensions of the Clay viewport</summary>
 public struct ClayDimensions
 {
     public float Width  { get; set; }
     public float Height { get; set; }
+
+    public static implicit operator ClayDimensions((float, float) tuple) => new ClayDimensions { Width = tuple.Item1, Height = tuple.Item2 };
 }
 
 public struct ClayVector2
@@ -906,8 +936,8 @@ public struct ClayScrollContainerData
     public  ClayVector2 ScrollPosition => Marshal.PtrToStructure<ClayVector2>(_scrollPosition);
     private IntPtr      _scrollPosition;
 
-    public ClayDimensions          ScrollContainerDimensions { get; set; }
-    public ClayDimensions          ContentDimensions         { get; set; }
+    public ClayDimensions      ScrollContainerDimensions { get; set; }
+    public ClayDimensions      ContentDimensions         { get; set; }
     public ScrollElementConfig Config                    { get; set; }
 
     [field: MarshalAs(UnmanagedType.Bool)]

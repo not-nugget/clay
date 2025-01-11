@@ -4,11 +4,15 @@ ClayContext? context = null;
 
 try
 {
-    context = ClayContext.Create(new ClayDimensions
-    {
-        Width  = 100,
-        Height = 100,
-    });
+    context = ClayContext.Create(
+        (100, 100),
+        (ref string text, ref TextElementConfig config) => (5, 5),
+        errorData =>
+        {
+            var a = $"Clay observed an error: \"[{errorData.ErrorType}] {errorData.ErrorText}\" (UserDataPtr: {errorData.UserData})";
+            Console.Error.WriteLine(a);
+            throw new ApplicationException(a);
+        });
 
     var l = new LayoutConfig
     {
@@ -26,13 +30,10 @@ try
     var layout = context.Layout();
     using (layout)
     {
-        using 
-        (
-            layout.Element(l, r)
-        )
+        using(layout.Element(l, r))
         {
             layout.Element("IdentifiedElement").End();
-            //layout.Text("Text!");
+            layout.Text("Text!");
             layout.Element(l, r).End();
             //layout.Text("Text!");
             layout.Element(l, r).End();
@@ -59,12 +60,9 @@ try
 catch (Exception ex)
 {
     Console.WriteLine(ex.Message);
+    throw;
 }
 
 context?.Dispose();
-
-_ = "";
-
-GC.Collect();
 
 _ = "";
