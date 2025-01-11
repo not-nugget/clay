@@ -809,6 +809,12 @@ public struct ElementHandle : IDisposable, IEquatable<ElementHandle>
     /// <summary>Completes the current element's configuration and opens the new element</summary>
     public void Configure<T>(T config) where T : struct, IElementConfig
     {
+        if (config is LayoutConfig layout)
+        {
+            Clay.AttachLayoutConfig(layout);
+            return;
+        }
+        
         Clay.AttachElementConfig(ClayElementConfigPointer.FromElementConfig(config));
     }
 
