@@ -1,5 +1,7 @@
 ﻿using System.Runtime.InteropServices;
 
+using Clay.Types.Internal;
+
 namespace Clay.Types.Error;
 
 /// <summary>Data sent to the error function handler when Clay encounters an internal error</summary>
