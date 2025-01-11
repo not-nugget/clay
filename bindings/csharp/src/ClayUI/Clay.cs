@@ -1,4 +1,7 @@
-﻿using System.Runtime.InteropServices;
+﻿using System.Numerics;
+using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
+using System.Runtime.InteropServices.Marshalling;
 
 using Clay.Types.Error;
 
@@ -6,15 +9,35 @@ namespace Clay;
 
 /// <summary>On element hover handler function signature which will be called by unmanaged code</summary>
 [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
-public delegate void OnHoverFunctionHandler(ClayElementId elementId, ClayPointerData pointerData, IntPtr userData);
+public delegate void OnHoverFunctionHandler(ElementId elementId, ClayPointerData pointerData, IntPtr userData);
 
 /// <summary>Measure text function signature which will be called by unmanaged code</summary>
 [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
-public delegate ClayDimensions MeasureTextFunction(ref ClayString text, ref ClayTextElementConfig config);
+public delegate ClayDimensions MeasureTextFunction([MarshalUsing(typeof(ClayStringToRefClrStringMarshaller))] ref string text, ref TextElementConfig config);
 
 /// <summary>Query scroll offset function signature which will be called by unmanaged code</summary>
 [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
 public delegate ClayVector2 QueryScrollOffsetFunction(uint elementId);
+
+[CustomMarshaller(typeof(string), MarshalMode.UnmanagedToManagedRef, typeof(ClayStringToRefClrStringMarshaller))]
+internal static unsafe class ClayStringToRefClrStringMarshaller
+{
+    public static string ConvertToManaged(nint unmanaged)
+    {
+        var clayString = Marshal.PtrToStructure<ClayString>(unmanaged);
+        return Marshal.PtrToStringUTF8(clayString.Chars, clayString.Length);
+    }
+
+    public static nint ConvertToUnmanaged(string managed)
+    {
+        var clayStr = new ClayString
+        {
+            Length = managed.Length,
+            Chars  = Marshal.StringToCoTaskMemUTF8(managed),
+        };
+        return new IntPtr(Unsafe.AsPointer(ref clayStr));
+    }
+}
 
 /// <summary>Exposes the internal bindings to Clay for use in <see cref="ClayContext" /></summary>
 internal static partial class Clay
@@ -38,11 +61,16 @@ internal static partial class Clay
             }
 
             var errorHandler = new ClayErrorHandler();
-            if (errorHandlerCallback != null)
-                errorHandler.ErrorHandlerFunction = errorHandlerCallback;
+
+            //TODO TEMPORARY
+            errorHandler.ErrorHandlerFunction = Temporary__ClayError;
+            // if (errorHandlerCallback != null)
+            //     errorHandler.ErrorHandlerFunction = errorHandlerCallback;
 
             var arena = Clay_CreateArenaWithCapacityAndMemory(memorySize, memory);
             Clay_Initialize(arena, dimensions, errorHandler);
+            
+            Clay_SetMeasureTextFunction(Temporary__MeasureText); //TODO temporary
             context = new ClayContext(arena);
         }
         catch (Exception e)
@@ -51,6 +79,21 @@ internal static partial class Clay
         }
 
         return context;
+    }
+
+    internal static void Temporary__ClayError(ErrorData errorData)
+    {
+        Console.Error.WriteLine($"Clay encountered an error {errorData.ErrorType}:{errorData.ErrorText}");
+    }
+    
+    internal static ClayDimensions Temporary__MeasureText(ref string text, ref TextElementConfig config)
+    {
+        Console.WriteLine($"Clay calling MeasureText: {text};");
+        return new ClayDimensions()
+        {
+            Height = 10,
+            Width  = 10,
+        };
     }
 
     /// <summary>Start a new Clay layout</summary>
@@ -62,7 +105,7 @@ internal static partial class Clay
     internal static ClayRenderCommand[] EndLayout()
     {
         var nativeArray    = Clay_EndLayout();
-        var renderCommands = new ClayRenderCommand[nativeArray.Length];
+        var renderCommands = new ClayRenderCommand[nativeArray.Length]; //TODO array pooling?
 
         var    commandSize = Marshal.SizeOf<ClayRenderCommand>();
         IntPtr sourceArrayPtr;
@@ -80,6 +123,72 @@ internal static partial class Clay
 
         return renderCommands;
     }
+    
+    /// <summary>Opens a new Clay element</summary>
+    internal static void OpenElement()
+        => Clay__OpenElement();
+
+    public static void OpenTextElement(string text, ref TextElementConfig config)
+    {
+        var clayString = new ClayString()
+        {
+            Length = text.Length,
+            Chars = Marshal.StringToCoTaskMemAuto(text),
+        };
+
+        try
+        {
+            Clay__OpenTextElement(clayString, ref config);
+        }
+        catch (Exception e)
+        {
+            Console.Error.WriteLine(e);
+            throw;
+        }
+    }
+    
+    internal static void AttachId(ref ElementId elementId)
+    {
+        // TODO this will prevent a fatal error, BUT it will cause some issues if ever one tries comparing two ElementHandles, as their IDs will not be set correctly. I do not know if i currently have a way to get the current element's ID generated by clay, or get the current element's data to fetch the ID
+        if (string.IsNullOrWhiteSpace(elementId.Value))
+            return; // Do nothing if the ID is unset and let Clay generate the ID
+        
+        var seed = Clay__GetParentElementId();
+        var i    = elementId.Offset;
+        var clayString = new ClayString
+        {
+            Length = elementId.Value.Length,
+        };
+
+        unsafe
+        {
+            fixed (char* stringPtr = elementId.Value)
+            {
+                clayString.Chars = new IntPtr(&stringPtr[0]);
+            }
+        }
+
+        var unmanagedElementId = Clay__HashString(clayString, i, seed);
+        Clay__AttachId(unmanagedElementId);
+        elementId = new ElementId
+        {
+            Value  = Marshal.PtrToStringUTF8(unmanagedElementId.StringId.Chars, unmanagedElementId.StringId.Length),
+            Offset = unmanagedElementId.Offset,
+            BaseId = unmanagedElementId.BaseId,
+            IdHash = unmanagedElementId.Id,
+        };
+    }
+
+    internal static void AttachElementConfig(ClayElementConfigPointer configPointer)
+        => Clay__AttachElementConfig((ClayElementConfigUnion)configPointer.ConfigPointer, configPointer.Type);
+
+    /// <summary>If an element is currently open, the pending set configurations are applied</summary>
+    internal static void PostConfigureOpenElement() 
+        => Clay__ElementPostConfiguration();
+
+    /// <summary>Closes the currently open Clay element</summary>
+    internal static void CloseElement()
+        => Clay__CloseElement();
 
     #region 1:1 Bindings
     [LibraryImport("clay.dll")]
@@ -159,8 +268,9 @@ internal static partial class Clay
     [LibraryImport("clay.dll")]
     private static partial void Clay__CloseElement();
 
-    [DllImport("clay.dll")]
-    private static extern ref ClayLayoutConfig Clay__StoreLayoutConfig(ClayLayoutConfig config);
+    /// <returns><see cref="IntPtr"/> that points to a Clay managed instance of <see cref="LayoutConfig"/>(<paramref name="config"/>)</returns>
+    [LibraryImport("clay.dll")]
+    private static partial IntPtr Clay__StoreLayoutConfig(LayoutConfig config);
 
     [LibraryImport("clay.dll")]
     private static partial void Clay__ElementPostConfiguration();
@@ -169,16 +279,16 @@ internal static partial class Clay
     private static partial void Clay__AttachId(ClayElementId id);
 
     [LibraryImport("clay.dll")]
-    private static partial void Clay__AttachLayoutConfig(ref ClayLayoutConfig config);
+    private static partial void Clay__AttachLayoutConfig(ref LayoutConfig config);
+
+    [LibraryImport("clay.dll")]
+    private static partial void Clay__AttachElementConfig(ClayElementConfigUnion config, ClayElementConfigType type);
 
     [DllImport("clay.dll")]
-    private static extern void Clay__AttachElementConfig(ClayElementConfigUnion config, ClayElementConfigType type);
+    private static extern ref RectangleElementConfig Clay__StoreRectangleElementConfig(RectangleElementConfig config);
 
     [DllImport("clay.dll")]
-    private static extern ref ClayRectangleElementConfig Clay__StoreRectangleElementConfig(ClayRectangleElementConfig config);
-
-    [DllImport("clay.dll")]
-    private static extern ref ClayTextElementConfig Clay__StoreTextElementConfig(ClayTextElementConfig config);
+    private static extern ref TextElementConfig Clay__StoreTextElementConfig(TextElementConfig config);
 
     [DllImport("clay.dll")]
     private static extern ref ClayImageElementConfig Clay__StoreImageElementConfig(ClayImageElementConfig config);
@@ -200,18 +310,21 @@ internal static partial class Clay
     private static partial ClayElementId Clay__HashString(ClayString key, uint offset, uint seed);
 
     [LibraryImport("clay.dll")]
-    private static partial void Clay__OpenTextElement(ClayString text, ref ClayTextElementConfig textConfig);
+    private static partial void Clay__OpenTextElement(ClayString text, ref TextElementConfig textConfig);
 
     [LibraryImport("clay.dll")]
     private static partial uint Clay__GetParentElementId();
+
+    [LibraryImport("clay.dll")]
+    private static partial IntPtr Clay__GetOpenLayoutElement();
     #endregion
 }
 
-public struct ClayString
+/// <summary>Interop type used by Clay for all things Text related</summary>
+internal struct ClayString
 {
-    //TODO Clay_String is not a private type, but it should be marshalled to/from a string or ReadOnlySpan<char> in all user code for convinience
-    internal int    length;
-    internal IntPtr chars; //TODO SafeHandle, or unsafe ClayString*, or alternative layout?
+    public int    Length { get; internal set; }
+    public IntPtr Chars  { get; internal set; }
 }
 
 internal struct ClayStringArray
@@ -259,7 +372,7 @@ public struct ClayColor
     public float A { get; set; }
 }
 
-internal struct ClayBoundingBox
+public struct ClayBoundingBox
 {
     //TODO is there a Bounds in the BCL? if not, this will suffice
     public float X      { get; set; }
@@ -268,14 +381,36 @@ internal struct ClayBoundingBox
     public float Height { get; set; }
 }
 
-//TODO the front-facing elementID should just be a string, as it is going to be a one-dimensional interop (C# to Clay). We should use an intermediate interop struct for the incoming raw bytes that just get converted to System.String, as we never have a need for the Clay formatting of the element id
-public struct ClayElementId
+/// <summary>Uniquely identifies an element within Clay. Supports offset IDs (within Clay) to avoid generating many dynamic IDs at runtime</summary>
+/// <param name="value">Unique element identifier</param>
+/// <param name="offset">Unique element offset</param>
+public readonly struct ElementId(string value, uint offset = 0u)
 {
-    //TODO there is some logic in clay with what an element id is. this should be the public facing id that is shown to the user, the rest should be private by design
-    private uint       id;
-    private uint       offset;
-    private uint       baseId;
-    private ClayString stringId;
+    /// <summary>Managed string representation of an element's ID</summary>
+    public string Value { get; init; } = value;
+
+    /// <summary>Offset index of an element's ID</summary>
+    public uint Offset { get; init; } = offset;
+
+    /// <summary>Clay-assigned BaseId (used with offset IDs)</summary>
+    public uint? BaseId { get; internal init; }
+
+    /// <summary>Clay-generated unique hash</summary>
+    public uint? IdHash { get; internal init; }
+
+    public static implicit operator ElementId(string         id)    => new ElementId(id);
+    public static implicit operator ElementId((string, uint) tuple) => new ElementId(tuple.Item1, tuple.Item2);
+}
+
+/// <summary>Clay_ElementId Interop structure</summary>
+internal struct ClayElementId
+{
+    #pragma warning disable CS0649 // Field is never assigned to, and will always have its default value - Field is assigned in unmanaged code
+    internal uint       Id;
+    internal uint       Offset;
+    internal uint       BaseId;
+    internal ClayString StringId;
+    #pragma warning restore CS0649 // Field is never assigned to, and will always have its default value
 }
 
 /// <summary>TODO</summary>
@@ -288,7 +423,7 @@ internal struct CornerRadius
 }
 
 [Flags]
-internal enum ClayElementConfigType : byte
+public enum ClayElementConfigType : byte
 {
     None              = 0,
     Rectangle         = 1,
@@ -300,88 +435,154 @@ internal enum ClayElementConfigType : byte
     Custom            = 64,
 }
 
-//TODO update names and add xmldoc comments to reflect the changes 
-public enum ClayLayoutDirection : byte
+/// <summary>Controls the default layout direction of an element's children</summary>
+public enum LayoutDirection : byte
 {
-    //TODO update names and add xmldoc comments to reflect the changes
-    CLAY_LEFT_TO_RIGHT,
-    CLAY_TOP_TO_BOTTOM,
+    /// <summary>Elements are placed starting from the left and continuing to the right</summary>
+    LeftToRight,
+
+    /// <summary>Elements are placed at the top and continuing to the bottom</summary>
+    TopToBottom,
 }
 
 //TODO update names and add xmldoc comments to reflect the changes
-public enum ClayLayoutAlignmentX : byte
+/// <summary>Controls the horizontal alignment of an element's children</summary>
+public enum LayoutAlignmentX : byte
 {
-    //TODO update names and add xmldoc comments to reflect the changes
-    CLAY_ALIGN_X_LEFT,
-    CLAY_ALIGN_X_RIGHT,
-    CLAY_ALIGN_X_CENTER,
+    /// <summary>Child elements are horizontally aligned to the left of this element</summary>
+    Left,
+
+    /// <summary>Child elements are horizontally aligned to the right of this element</summary>
+    Right,
+
+    /// <summary>Child elements are horizontally aligned in the middle of this element</summary>
+    Center,
 }
 
 //TODO update names and add xmldoc comments to reflect the changes
-public enum ClayLayoutAlignmentY
+/// <summary>Controls the vertical alignment of an element's children</summary>
+public enum LayoutAlignmentY
 {
-    //TODO update names and add xmldoc comments to reflect the changes
-    CLAY_ALIGN_Y_TOP,
-    CLAY_ALIGN_Y_BOTTOM,
-    CLAY_ALIGN_Y_CENTER,
+    /// <summary>Child elements are vertically aligned to the top of this element</summary>
+    Top,
+
+    /// <summary>Child elements are vertically aligned to the bottom of this element</summary>
+    Bottom,
+
+    /// <summary>Child elements are vertically aligned in the middle of this element</summary>
+    Center,
 }
 
-//TODO this type needs to be understood better
-public enum ClaySizingType
+/// <summary>Indicates how an element is sized</summary>
+public enum SizingType
 {
-    CLAY__SIZING_TYPE_FIT,
-    CLAY__SIZING_TYPE_GROW,
-    CLAY__SIZING_TYPE_PERCENT,
-    CLAY__SIZING_TYPE_FIXED,
+    //TODO verify all comments
+    /// <summary>Element is sized to fit its contents</summary>
+    Fit,
+
+    /// <summary>Element will grow to fit its container</summary>
+    Grow,
+
+    /// <summary>Element is sized by a percentage of its container</summary>
+    Percent,
+
+    /// <summary>Element is sized by its fixed minimum and maximum</summary>
+    Fixed,
 }
 
-public struct ClayChildAlignment
+/// <summary>Controls the alignment of an element's children</summary>
+public struct ChildAlignment
 {
-    public ClayLayoutAlignmentX X { get; set; }
-    public ClayLayoutAlignmentY Y { get; set; }
+    public LayoutAlignmentX X { get; set; }
+    public LayoutAlignmentY Y { get; set; }
+
+    public static implicit operator ChildAlignment((LayoutAlignmentX, LayoutAlignmentY) tuple) => new ChildAlignment { X = tuple.Item1, Y = tuple.Item2 };
 }
 
-public struct ClaySizingMinMax
+/// <summary>Represents the min and max values of a sizing constraint</summary>
+public struct SizingMinMax(float min, float max)
 {
-    public float Min { get; set; }
-    public float Max { get; set; }
+    public float Min { get; set; } = min;
+    public float Max { get; set; } = max;
+
+    public static implicit operator SizingMinMax((float, float) tuple) => new SizingMinMax(tuple.Item1, tuple.Item2);
 }
 
-//TODO this type is a union found within Clay_SizingAxis and is necessary for marshalling
-public struct ClaySize
+/// <summary>Size of an element, represented as either a minimum or a maximum (<see cref="MinMax"/>),
+/// <em>or</em> a percentage relative to its container (<see cref="Percent"/>)</summary>
+[StructLayout(LayoutKind.Explicit)]
+public struct Size
 {
-    public ClaySizingMinMax MinMax  { get; set; }
-    public float            Percent { get; set; }
+    [field: FieldOffset(0)]
+    public SizingMinMax MinMax { get; set; }
+
+    [field: FieldOffset(0)]
+    public float Percent { get; set; }
+
+    public static implicit operator Size(SizingMinMax   minMax) => new Size { MinMax = minMax };
+    public static implicit operator Size((float, float) tuple)  => new Size { MinMax = tuple };
+
+    public static implicit operator Size(float percent) => new Size { Percent = percent };
 }
 
-public struct ClaySizingAxis
+/// <summary>Controls sizing along an element's axis</summary>
+public struct SizingAxis
 {
-    public ClaySize       Size { get; set; }
-    public ClaySizingType Type { get; set; }
+    public Size       Size { get; set; }
+    public SizingType Type { get; set; }
+
+    public static implicit operator SizingAxis(float percent) => new SizingAxis
+    {
+        Size = new Size { Percent = percent },
+        Type = SizingType.Percent,
+    };
+
+    public static implicit operator SizingAxis((float, float) tuple) => new SizingAxis
+    {
+        Size = new Size { MinMax = tuple },
+        Type = SizingType.Fixed,
+    };
+
+    public static implicit operator SizingAxis(SizingType type) => new SizingAxis { Type = type, };
 }
 
-public struct ClaySizing
+/// <summary>Controls the sizing of an element</summary>
+public struct Sizing
 {
-    public ClaySizingAxis Width  { get; set; }
-    public ClaySizingAxis Height { get; set; }
+    public SizingAxis Width  { get; set; }
+    public SizingAxis Height { get; set; }
+
+    public static implicit operator Sizing((SizingAxis, SizingAxis) tuple) => new Sizing
+    {
+        Width  = tuple.Item1,
+        Height = tuple.Item2,
+    };
 }
 
-public struct ClayPadding
+/// <summary>Controls an element's padding</summary>
+public struct Padding
 {
     public ushort X { get; set; }
     public ushort Y { get; set; }
+
+    public static implicit operator Padding((ushort, ushort) tuple) => new Padding
+    {
+        X = tuple.Item1,
+        Y = tuple.Item2,
+    };
 }
 
-public struct ClayLayoutConfig
+/// <summary>Configures an element's various layout options</summary>
+public struct LayoutConfig
 {
-    public ClaySizing          Sizing          { get; set; }
-    public ClayPadding         Padding         { get; set; }
-    public ushort              ChildGap        { get; set; }
-    public ClayChildAlignment  ChildAlignment  { get; set; }
-    public ClayLayoutDirection LayoutDirection { get; set; }
+    public Sizing          Sizing          { get; set; }
+    public Padding         Padding         { get; set; }
+    public ushort          ChildGap        { get; set; }
+    public ChildAlignment  ChildAlignment  { get; set; }
+    public LayoutDirection LayoutDirection { get; set; }
 }
 
-internal struct ClayRectangleElementConfig
+internal struct RectangleElementConfig : IElementConfig
 {
     public ClayColor    Color        { get; set; }
     public CornerRadius CornerRadius { get; set; }
@@ -396,7 +597,7 @@ public enum ClayTextElementConfigWrapMode : byte
     CLAY_TEXT_WRAP_NONE,
 }
 
-public struct ClayTextElementConfig
+public struct TextElementConfig : IElementConfig
 {
     public ClayColor                     TextColor     { get; set; }
     public ushort                        FontId        { get; set; } //TODO helper FontAsset
@@ -408,7 +609,7 @@ public struct ClayTextElementConfig
     //TODO Read rectangle element above for information about element data extension
 }
 
-internal struct ClayImageElementConfig
+internal struct ClayImageElementConfig : IElementConfig
 {
     public IntPtr         ImageData        { get; set; }
     public ClayDimensions SourceDimensions { get; set; }
@@ -443,7 +644,7 @@ internal enum ClayPointerCaptureMode //TODO NOTE: Once this is implemented, this
     CLAY_POINTER_CAPTURE_MODE_PASSTHROUGH,
 }
 
-internal struct ClayFloatingElementConfig
+internal struct ClayFloatingElementConfig : IElementConfig
 {
     public ClayVector2              Offset             { get; set; }
     public ClayDimensions           Expand             { get; set; }
@@ -455,7 +656,7 @@ internal struct ClayFloatingElementConfig
 
 //TODO CustomElementConfig (Line 372 at time of writing)
 
-public struct ClayScrollElementConfig
+public struct ClayScrollElementConfig : IElementConfig
 {
     [field: MarshalAs(UnmanagedType.Bool)]
     public bool Horizontal { get; set; }
@@ -470,7 +671,7 @@ internal struct ClayBorder
     public ClayColor Color { get; set; }
 }
 
-internal struct ClayBorderElementConfig
+internal struct ClayBorderElementConfig : IElementConfig
 {
     public ClayBorder   Left            { get; set; }
     public ClayBorder   Right           { get; set; }
@@ -480,35 +681,138 @@ internal struct ClayBorderElementConfig
     public CornerRadius CornerRadius    { get; set; }
 }
 
-// TODO the union members are pointers in Clay, not sure how this translates...may need to be unsafe and with actual pointers 
-[StructLayout(LayoutKind.Explicit)]
-public struct ClayElementConfigUnion
+/// <summary>Required for interoperability. Should not be user facing</summary>
+internal struct ClayElementConfigUnion
 {
-    [FieldOffset(0)]
-    private ClayRectangleElementConfig rectangleElementConfig;
+    // NOTE: there is no need to have all the different pointers, the C union
+    // is just a wrapper around single pointer with more type definition information
+    public IntPtr ConfigPointer { get; init; }
 
-    [FieldOffset(0)]
-    private ClayTextElementConfig textElementConfig;
-
-    [FieldOffset(0)]
-    private ClayImageElementConfig imageElementConfig;
-
-    [FieldOffset(0)]
-    private ClayFloatingElementConfig floatingElementConfig;
-
-    [FieldOffset(0)]
-    private ClayScrollElementConfig scrollElementConfig;
-
-    [FieldOffset(0)]
-    private ClayBorderElementConfig borderElementConfig;
+    public static explicit operator ClayElementConfigUnion(IntPtr pointer) => new ClayElementConfigUnion { ConfigPointer = pointer };
 }
 
 /// <summary>Represents a union of each individual element config type</summary>
-internal struct ClayElementConfig
+internal struct ClayElementConfigPointer
 {
-    private ClayElementConfigType Type   { get; set; }
-    public  IntPtr                Config { get; set; }
+    public ClayElementConfigType Type          { get; private set; }
+    public IntPtr                ConfigPointer { get; private set; }
+
+    /// <summary>Creates a new <see cref="ClayElementConfigPointer"/> using managed runtime type information</summary>
+    internal static ClayElementConfigPointer FromElementConfig<T>(T config) where T : struct, IElementConfig
+    {
+        var pointer = new ClayElementConfigPointer();
+
+        switch (config)
+        {
+            case RectangleElementConfig rect:
+                pointer.Type = ClayElementConfigType.Rectangle;
+                unsafe
+                {
+                    pointer.ConfigPointer = new IntPtr(Unsafe.AsPointer(ref rect));
+                }
+
+                break;
+
+            case ClayBorderElementConfig border:
+                pointer.Type = ClayElementConfigType.BorderContainer;
+                unsafe
+                {
+                    pointer.ConfigPointer = new IntPtr(Unsafe.AsPointer(ref border));
+                }
+
+                break;
+
+            case ClayFloatingElementConfig floating:
+                pointer.Type = ClayElementConfigType.FloatingContainer;
+                unsafe
+                {
+                    pointer.ConfigPointer = new IntPtr(Unsafe.AsPointer(ref floating));
+                }
+
+                break;
+
+            case ClayScrollElementConfig scroll:
+                pointer.Type = ClayElementConfigType.ScrollContainer;
+                unsafe
+                {
+                    pointer.ConfigPointer = new IntPtr(Unsafe.AsPointer(ref scroll));
+                }
+
+                break;
+
+            case ClayImageElementConfig image:
+                pointer.Type = ClayElementConfigType.Image;
+                unsafe
+                {
+                    pointer.ConfigPointer = new IntPtr(Unsafe.AsPointer(ref image));
+                }
+
+                break;
+
+            case TextElementConfig text:
+                pointer.Type = ClayElementConfigType.Text;
+                unsafe
+                {
+                    pointer.ConfigPointer = new IntPtr(Unsafe.AsPointer(ref text));
+                }
+
+                break;
+
+            case ClayDefaultElementConfig:
+                pointer.Type          = ClayElementConfigType.None;
+                pointer.ConfigPointer = IntPtr.Zero;
+                break;
+
+            default:
+                throw new NotSupportedException("An unsupported IElementConfig was encountered");
+        }
+
+        return pointer;
+    }
+
+    //TODO not sure if we ever have a need to fetch an element's configuration in the managed runtime
+    // /// <summary>Tries to retrieve the element configuration located at <see cref="ConfigPointer"/> typed as <typeparamref name="T"/></summary>
+    // /// <param name="config">Typed configuration if the retrieval was successful</param>
+    // /// <typeparam name="T">Type to retrieve the configuration as</typeparam>
+    // /// <returns><see langword="true"/> if the typed configuration was successfully retrieved, otherwise <see langword="false"/></returns>
+    // public bool TryGetConfig<T>(out T? config) where T : struct, IElementConfig
+    // {
+    //     config = null;
+    //     if (_configPtr == IntPtr.Zero || BitOperations.PopCount((byte)Type) > 1)
+    //     {
+    //         return false;
+    //     }
+    //
+    //     // ReSharper disable once SwitchStatementMissingSomeEnumCasesNoDefault - Default case will return false, which is intended
+    //     switch (Type)
+    //     {
+    //         case ClayElementConfigType.Rectangle:
+    //         case ClayElementConfigType.BorderContainer:
+    //         case ClayElementConfigType.FloatingContainer:
+    //         case ClayElementConfigType.ScrollContainer:
+    //         case ClayElementConfigType.Image:
+    //         case ClayElementConfigType.Text:
+    //             try
+    //             {
+    //                 config = Marshal.PtrToStructure<T>(_configPtr);
+    //             }
+    //             catch
+    //             {
+    //                 // ignored, false will be returned as intended
+    //             }
+    //
+    //             break;
+    //     }
+    //
+    //     return config is not null;
+    // }
 }
+
+/// <summary>Marker interface used to ease the process of retrieving a typed element config from <see cref="ClayElementConfigPointer"/></summary>
+public interface IElementConfig;
+
+/// <summary>Represents an element with a default configuration</summary>
+public readonly struct ClayDefaultElementConfig : IElementConfig;
 
 public struct ClayScrollContainerData
 {
@@ -549,15 +853,22 @@ public enum ClayRenderCommandType : byte
     Custom,
 }
 
+/// <summary>Command that can be used to draw a part of the Clay UI to a window</summary>
 public struct ClayRenderCommand
 {
-    private ClayBoundingBox        boundingBox;
-    private ClayElementConfigUnion config;
-    private ClayString             text; // TODO I wish there was a way to avoid having to have this on every render command
-    private uint                   id;
-    private ClayRenderCommandType  commandType;
+    public ClayBoundingBox BoundingBox { get; private set; }
+
+    //public IElementConfig  Config      => null; //TODO do we need the element config in the marshaled runtime?
+    private ClayElementConfigPointer _configPointer;
+
+    //public  string     Text => null; //TODO get the string from ClayString, if ClayString is valid
+    private ClayString text;
+
+    public uint                  Id          { get; set; }
+    public ClayRenderCommandType CommandType { get; set; }
 }
 
+/// <summary>Internal representation of an array of <see cref="ClayRenderCommand"/>s. Should be converted to a .NET Array and never shown to the user</summary>
 internal struct ClayRenderCommandArray
 {
     public int Capacity { get; private set; }
